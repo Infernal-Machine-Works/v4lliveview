@@ -25,7 +25,7 @@
 #include <unistd.h>
 
 #define V4LLIVE_NAME "v4lliveview"
-#define V4LLIVE_NODE "video-live0"
+#define V4LLIVE_NODE "video_live0"
 #define MAX_BUFFERS 32U
 
 struct buffer {
@@ -113,6 +113,15 @@ is_forwarded_control(uint32_t id)
         return false;
     }
 }
+
+static const uint32_t forwarded_controls[] = {
+    V4L2_CID_AUTO_WHITE_BALANCE,
+    V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+    V4L2_CID_DO_WHITE_BALANCE,
+    V4L2_CID_EXPOSURE_AUTO,
+    V4L2_CID_EXPOSURE_ABSOLUTE,
+    V4L2_CID_EXPOSURE_AUTO_PRIORITY,
+};
 
 static void
 free_buffers_locked(struct client *client)
@@ -492,11 +501,105 @@ enumerate_yuyv_sizes(void *user_data, unsigned long command, size_t size)
 }
 
 static int
-v4l_open(struct cuse_dev *device, int flags)
+query_forwarded_control(void *user_data, unsigned long command, size_t size)
+{
+    uint8_t local[sizeof(struct v4l2_query_ext_ctrl)];
+    uint32_t requested;
+    int result;
+
+    result = copy_in(local, user_data, size);
+    if (result != 0)
+        return result;
+    requested = *(uint32_t *)(void *)local;
+    if ((requested & V4L2_CTRL_FLAG_NEXT_CTRL) == 0) {
+        if (!is_forwarded_control(requested))
+            return EINVAL;
+        pthread_mutex_lock(&app.camera_lock);
+        result = xioctl(app.camera_fd, command, local);
+        if (result == -1)
+            result = errno;
+        else
+            result = 0;
+        pthread_mutex_unlock(&app.camera_lock);
+        return result == 0 ? copy_out(local, user_data, size) : result;
+    }
+
+    requested &= ~(V4L2_CTRL_FLAG_NEXT_CTRL | V4L2_CTRL_FLAG_NEXT_COMPOUND);
+    for (;;) {
+        uint32_t candidate = 0;
+        for (size_t index = 0; index < sizeof(forwarded_controls) /
+            sizeof(forwarded_controls[0]); ++index) {
+            uint32_t id = forwarded_controls[index];
+            if (id > requested && (candidate == 0 || id < candidate))
+                candidate = id;
+        }
+        if (candidate == 0)
+            return EINVAL;
+        *(uint32_t *)(void *)local = candidate;
+        pthread_mutex_lock(&app.camera_lock);
+        result = xioctl(app.camera_fd, command, local);
+        if (result == -1)
+            result = errno;
+        else
+            result = 0;
+        pthread_mutex_unlock(&app.camera_lock);
+        if (result == 0)
+            return copy_out(local, user_data, size);
+        requested = candidate;
+    }
+}
+
+static int
+forward_extended_controls(void *user_data, unsigned long command)
+{
+    struct v4l2_ext_controls controls;
+    struct v4l2_ext_control local_controls[16];
+    struct v4l2_ext_control *peer_controls;
+    int result;
+
+    result = copy_in(&controls, user_data, sizeof(controls));
+    if (result != 0)
+        return result;
+    if (controls.count > sizeof(local_controls) / sizeof(local_controls[0]))
+        return EINVAL;
+    peer_controls = controls.controls;
+    if (controls.count != 0) {
+        result = copy_in(local_controls, controls.controls,
+            controls.count * sizeof(local_controls[0]));
+        if (result != 0)
+            return result;
+    }
+    for (uint32_t index = 0; index < controls.count; ++index) {
+        if (!is_forwarded_control(local_controls[index].id))
+            return EINVAL;
+    }
+    controls.controls = local_controls;
+    pthread_mutex_lock(&app.camera_lock);
+    result = xioctl(app.camera_fd, command, &controls);
+    if (result == -1)
+        result = errno;
+    else
+        result = 0;
+    pthread_mutex_unlock(&app.camera_lock);
+    if (result != 0)
+        return result;
+    if (controls.count != 0) {
+        result = copy_out(local_controls, peer_controls,
+            controls.count * sizeof(local_controls[0]));
+        if (result != 0)
+            return result;
+    }
+    controls.controls = peer_controls;
+    return copy_out(&controls, user_data, sizeof(controls));
+}
+
+static int
+v4l_open_impl(struct cuse_dev *device, int flags)
 {
     struct client *client;
     (void)device;
     (void)flags;
+
 
     client = calloc(1, sizeof(*client));
     if (client == NULL)
@@ -514,7 +617,7 @@ v4l_open(struct cuse_dev *device, int flags)
 }
 
 static int
-v4l_close(struct cuse_dev *device, int flags)
+v4l_close_impl(struct cuse_dev *device, int flags)
 {
     struct client *client;
     (void)device;
@@ -538,7 +641,7 @@ v4l_close(struct cuse_dev *device, int flags)
 }
 
 static int
-v4l_ioctl(struct cuse_dev *device, int flags, unsigned long command,
+v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
     void *user_data)
 {
     struct client *client;
@@ -594,16 +697,12 @@ v4l_ioctl(struct cuse_dev *device, int flags, unsigned long command,
     case VIDIOC_G_CROP:
     case VIDIOC_S_CROP:
         return forward_ioctl(user_data, command, sizeof(struct v4l2_crop), false);
-    case VIDIOC_QUERYCTRL: {
-        struct v4l2_queryctrl control;
-        int result = forward_ioctl(user_data, command, sizeof(control), false);
-        if (result != 0)
-            return result;
-        result = copy_in(&control, user_data, sizeof(control));
-        if (result != 0)
-            return result;
-        return is_forwarded_control(control.id) ? 0 : EINVAL;
-    }
+    case VIDIOC_QUERYCTRL:
+        return query_forwarded_control(user_data, command,
+            sizeof(struct v4l2_queryctrl));
+    case VIDIOC_QUERY_EXT_CTRL:
+        return query_forwarded_control(user_data, command,
+            sizeof(struct v4l2_query_ext_ctrl));
     case VIDIOC_G_CTRL:
     case VIDIOC_S_CTRL: {
         struct v4l2_control control;
@@ -614,6 +713,10 @@ v4l_ioctl(struct cuse_dev *device, int flags, unsigned long command,
             return EINVAL;
         return forward_ioctl(user_data, command, sizeof(control), false);
     }
+    case VIDIOC_G_EXT_CTRLS:
+    case VIDIOC_S_EXT_CTRLS:
+    case VIDIOC_TRY_EXT_CTRLS:
+        return forward_extended_controls(user_data, command);
     case VIDIOC_REQBUFS: {
         struct v4l2_requestbuffers request;
         int result = copy_in(&request, user_data, sizeof(request));
@@ -701,7 +804,7 @@ v4l_ioctl(struct cuse_dev *device, int flags, unsigned long command,
 }
 
 static int
-v4l_poll(struct cuse_dev *device, int flags, int events)
+v4l_poll_impl(struct cuse_dev *device, int flags, int events)
 {
     struct client *client;
     int result = 0;
@@ -720,6 +823,65 @@ v4l_poll(struct cuse_dev *device, int flags, int events)
         }
     }
     pthread_mutex_unlock(&app.state_lock);
+    return result;
+}
+
+static int
+errno_to_cuse(int error)
+{
+    switch (error) {
+    case 0:
+        return CUSE_ERR_NONE;
+    case EBUSY:
+        return CUSE_ERR_BUSY;
+    case EAGAIN:
+        return CUSE_ERR_WOULDBLOCK;
+    case EINVAL:
+    case ENOTTY:
+        return CUSE_ERR_INVALID;
+    case ENOMEM:
+        return CUSE_ERR_NO_MEMORY;
+    case EFAULT:
+        return CUSE_ERR_FAULT;
+    case EINTR:
+        return CUSE_ERR_SIGNAL;
+    case ENODEV:
+    case ENXIO:
+        return CUSE_ERR_NO_DEVICE;
+    default:
+        return CUSE_ERR_OTHER;
+    }
+}
+
+static int
+v4l_open(struct cuse_dev *device, int flags)
+{
+    return errno_to_cuse(v4l_open_impl(device, flags));
+}
+
+static int
+v4l_close(struct cuse_dev *device, int flags)
+{
+    return errno_to_cuse(v4l_close_impl(device, flags));
+}
+
+static int
+v4l_ioctl(struct cuse_dev *device, int flags, unsigned long command,
+    void *user_data)
+{
+    return errno_to_cuse(v4l_ioctl_impl(device, flags, command, user_data));
+}
+
+static int
+v4l_poll(struct cuse_dev *device, int flags, int events)
+{
+    int readiness = v4l_poll_impl(device, flags, events);
+    int result = CUSE_POLL_NONE;
+
+    if ((readiness & (POLLIN | POLLRDNORM)) != 0)
+        result |= CUSE_POLL_READ;
+    if ((readiness & POLLERR) != 0)
+        result |= CUSE_POLL_ERROR;
     return result;
 }
 
@@ -885,7 +1047,7 @@ int
 main(int argc, char **argv)
 {
     pthread_t capture_thread;
-    pthread_t cuse_threads[2];
+    pthread_t cuse_thread;
     struct sigaction action;
     int result;
 
@@ -897,6 +1059,7 @@ main(int argc, char **argv)
     action.sa_handler = request_stop;
     (void)sigaction(SIGINT, &action, NULL);
     (void)sigaction(SIGTERM, &action, NULL);
+    (void)sigaction(SIGUSR1, &action, NULL);
 
     app.camera_fd = open(argv[1], O_RDWR | O_NONBLOCK);
     if (app.camera_fd == -1) {
@@ -920,8 +1083,7 @@ main(int argc, char **argv)
         return 1;
     }
     if (pthread_create(&capture_thread, NULL, capture_worker, NULL) != 0 ||
-        pthread_create(&cuse_threads[0], NULL, cuse_worker, NULL) != 0 ||
-        pthread_create(&cuse_threads[1], NULL, cuse_worker, NULL) != 0) {
+        pthread_create(&cuse_thread, NULL, cuse_worker, NULL) != 0) {
         fprintf(stderr, "%s: cannot start worker threads\n", V4LLIVE_NAME);
         stop_requested = 1;
         app.stop = true;
@@ -942,10 +1104,10 @@ main(int argc, char **argv)
     pthread_cond_broadcast(&app.state_changed);
     pthread_mutex_unlock(&app.state_lock);
     cuse_dev_destroy(app.cuse_device);
-    (void)cuse_uninit();
+    (void)pthread_kill(cuse_thread, SIGUSR1);
     (void)pthread_join(capture_thread, NULL);
-    (void)pthread_join(cuse_threads[0], NULL);
-    (void)pthread_join(cuse_threads[1], NULL);
+    (void)pthread_join(cuse_thread, NULL);
+    (void)cuse_uninit();
     free(app.display_yuyv);
     (void)close(app.camera_fd);
     return result;

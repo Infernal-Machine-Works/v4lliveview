@@ -12,11 +12,11 @@ kldload cuse                 # once, if it is not already loaded
 sudo ./v4lliveview /dev/video0
 ```
 
-The default virtual node is `/dev/video-live0`, mode `0660`, with the owner
+The default virtual node is `/dev/video_live0`, mode `0660`, with the owner
 and group of the process that launches it.  Point the client at that node:
 
 ```python
-simplepycam.Camera('/dev/video-live0')
+simplepycam.Camera('/dev/video_live0')
 ```
 
 The application is foreground-only. Closing its X11 window removes the virtual

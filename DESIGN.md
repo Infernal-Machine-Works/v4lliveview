@@ -36,7 +36,7 @@ queues, `poll(2)`, and commonly `mmap(2)`.
  simplepycam                       physical camera
        |                                  ^
        v                                  |
- /dev/video-live0 -> proxy/tee bridge ------+
+ /dev/video_live0 -> proxy/tee bridge ------+
                          |
                          +--> Xlib: draw current frame
 ```
@@ -45,7 +45,7 @@ queues, `poll(2)`, and commonly `mmap(2)`.
 
 The program is the only opener of the physical camera.  It does **not** choose
 an independent capture sequence or configuration.  Instead, the active host
-application opens `/dev/video-live0`; the module forwards its supported V4L2
+application opens `/dev/video_live0`; the module forwards its supported V4L2
 open, format, parameter, control, buffer, stream, and queue operations to the
 program, which performs them on the physical node in the same order.  The host
 application therefore drives the camera through the virtual interface and is
@@ -80,7 +80,7 @@ bytes.
 
 ### 3. Virtual V4L2 output backend
 
-This is the key feasibility boundary.  It exposes `/dev/video-live0` and
+This is the key feasibility boundary.  It exposes `/dev/video_live0` and
 implements a deliberately small, coherent capture-device profile:
 
 * `VIDIOC_QUERYCAP`, `ENUM_FMT`, `ENUM_FRAMESIZES`,
@@ -140,7 +140,7 @@ The program is launched in the foreground as:
 v4lliveview /dev/video0
 ```
 
-It creates a predictable virtual node (`/dev/video-live0` initially), opens
+It creates a predictable virtual node (`/dev/video_live0` initially), opens
 one X11 window, and displays the current frame when the host application has
 started capture through that node.
 The program removes its virtual node on clean exit.  A later `--output PATH`
@@ -216,7 +216,7 @@ arbitration is future work, not a hidden behaviour of the first build.
 3. Verify the virtual node’s advertised capabilities and all supported ioctl
    results with `v4l2-ctl`.
 4. Run simplepycam's actual static-image capture path against
-   `/dev/video-live0` while the X11 viewer runs; compare sequence/timestamps
+   `/dev/video_live0` while the X11 viewer runs; compare sequence/timestamps
    and checksums for frames received by each consumer.  Use `v4l2-ctl` only as
    a supplementary protocol probe, not as the compatibility verdict.
 5. Deliberately slow X11 drawing and client buffer requeue, proving that the
