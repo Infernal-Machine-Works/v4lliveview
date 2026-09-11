@@ -25,8 +25,10 @@
 #include <unistd.h>
 
 #define V4LLIVE_NAME "v4lliveview"
-#define V4LLIVE_NODE "video_live0"
 #define MAX_BUFFERS 32U
+#ifndef V4LLIVEVIEW_PORTS
+#define V4LLIVEVIEW_PORTS 1U
+#endif
 
 struct buffer {
     void *physical;
@@ -41,6 +43,14 @@ struct client {
     struct buffer buffers[MAX_BUFFERS];
     unsigned int count;
     bool streaming;
+    bool control_owner;
+    struct port *port;
+};
+
+struct port {
+    struct cuse_dev *device;
+    struct client *client;
+    unsigned int index;
 };
 
 struct application {
@@ -48,11 +58,11 @@ struct application {
     pthread_mutex_t camera_lock;
     pthread_mutex_t state_lock;
     pthread_cond_t state_changed;
-    struct client *owner;
+    struct client *control_client;
     bool source_streaming;
     bool source_lost;
     bool stop;
-    struct cuse_dev *cuse_device;
+    struct port ports[V4LLIVEVIEW_PORTS];
 
     uint8_t *display_yuyv;
     size_t display_size;
@@ -140,6 +150,8 @@ free_buffers_locked(struct client *client)
     client->count = 0;
     client->streaming = false;
 
+    if (!client->control_owner)
+        return;
     memset(&release, 0, sizeof(release));
     release.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     release.memory = V4L2_MEMORY_MMAP;
@@ -156,6 +168,33 @@ allocate_buffers(struct client *client, struct v4l2_requestbuffers *request)
         return EINVAL;
     if (request->count > MAX_BUFFERS)
         request->count = MAX_BUFFERS;
+
+    if (!client->control_owner) {
+        struct v4l2_format format;
+        memset(&format, 0, sizeof(format));
+        format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        pthread_mutex_lock(&app.camera_lock);
+        if (xioctl(app.camera_fd, VIDIOC_G_FMT, &format) == -1) {
+            int error = errno;
+            pthread_mutex_unlock(&app.camera_lock);
+            return error;
+        }
+        pthread_mutex_unlock(&app.camera_lock);
+        if (!is_yuyv(&format) || format.fmt.pix.sizeimage == 0)
+            return EINVAL;
+        for (unsigned int index = 0; index < request->count; ++index) {
+            client->buffers[index].virtual = cuse_vmalloc(format.fmt.pix.sizeimage);
+            if (client->buffers[index].virtual == NULL) {
+                for (unsigned int cleanup = 0; cleanup < index; ++cleanup)
+                    cuse_vmfree(client->buffers[cleanup].virtual);
+                memset(client->buffers, 0, sizeof(client->buffers));
+                return ENOMEM;
+            }
+            client->buffers[index].length = format.fmt.pix.sizeimage;
+        }
+        client->count = request->count;
+        return 0;
+    }
 
     pthread_mutex_lock(&app.camera_lock);
     free_buffers_locked(client);
@@ -225,7 +264,7 @@ start_source(struct client *client)
     unsigned int index;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-    if (client->count == 0)
+    if (!client->control_owner || client->count == 0)
         return EINVAL;
     pthread_mutex_lock(&app.camera_lock);
     for (index = 0; index < client->count; ++index) {
@@ -330,7 +369,7 @@ capture_worker(void *unused)
             pthread_mutex_unlock(&app.state_lock);
             break;
         }
-        client = app.owner;
+        client = app.control_client;
         pthread_mutex_unlock(&app.state_lock);
         if (client == NULL)
             continue;
@@ -361,26 +400,36 @@ capture_worker(void *unused)
         pthread_mutex_unlock(&app.camera_lock);
 
         pthread_mutex_lock(&app.state_lock);
-        for (unsigned int index = 0; index < client->count; ++index) {
-            if (client->buffers[index].queued && !client->buffers[index].ready) {
-                target = index;
-                break;
-            }
-        }
-        if (target != MAX_BUFFERS && source_buffer.index < client->count) {
-            struct buffer *destination = &client->buffers[target];
+        if (source_buffer.index < client->count) {
             struct buffer *source = &client->buffers[source_buffer.index];
-            size_t bytes = source_buffer.bytesused;
-            if (bytes > destination->length)
-                bytes = destination->length;
-            memcpy(destination->virtual, source->physical, bytes);
-            destination->metadata = source_buffer;
-            destination->metadata.index = target;
-            destination->metadata.bytesused = bytes;
-            destination->ready = true;
-            destination->queued = false;
-        } else {
-            ++app.client_drops;
+            for (unsigned int port_index = 0; port_index < V4LLIVEVIEW_PORTS;
+                ++port_index) {
+                struct client *recipient = app.ports[port_index].client;
+                if (recipient == NULL || !recipient->streaming)
+                    continue;
+                target = MAX_BUFFERS;
+                for (unsigned int index = 0; index < recipient->count; ++index) {
+                    if (recipient->buffers[index].queued &&
+                        !recipient->buffers[index].ready) {
+                        target = index;
+                        break;
+                    }
+                }
+                if (target == MAX_BUFFERS) {
+                    ++app.client_drops;
+                    continue;
+                }
+                struct buffer *destination = &recipient->buffers[target];
+                size_t bytes = source_buffer.bytesused;
+                if (bytes > destination->length)
+                    bytes = destination->length;
+                memcpy(destination->virtual, source->physical, bytes);
+                destination->metadata = source_buffer;
+                destination->metadata.index = target;
+                destination->metadata.bytesused = bytes;
+                destination->ready = true;
+                destination->queued = false;
+            }
         }
         pthread_mutex_unlock(&app.state_lock);
 
@@ -397,9 +446,9 @@ capture_worker(void *unused)
 }
 
 static struct client *
-current_client(void)
+current_client(struct cuse_dev *device)
 {
-    return cuse_dev_get_per_file_handle(app.cuse_device);
+    return cuse_dev_get_per_file_handle(device);
 }
 
 static int
@@ -597,21 +646,28 @@ static int
 v4l_open_impl(struct cuse_dev *device, int flags)
 {
     struct client *client;
-    (void)device;
+    struct port *port;
     (void)flags;
 
-
+    port = cuse_dev_get_priv0(device);
+    if (port == NULL)
+        return ENXIO;
     client = calloc(1, sizeof(*client));
     if (client == NULL)
         return ENOMEM;
     pthread_mutex_lock(&app.state_lock);
-    if (app.owner != NULL) {
+    if (port->client != NULL) {
         pthread_mutex_unlock(&app.state_lock);
         free(client);
         return EBUSY;
     }
-    app.owner = client;
-    cuse_dev_set_per_file_handle(app.cuse_device, client);
+    client->port = port;
+    if (app.control_client == NULL) {
+        client->control_owner = true;
+        app.control_client = client;
+    }
+    port->client = client;
+    cuse_dev_set_per_file_handle(device, client);
     pthread_mutex_unlock(&app.state_lock);
     return 0;
 }
@@ -620,10 +676,9 @@ static int
 v4l_close_impl(struct cuse_dev *device, int flags)
 {
     struct client *client;
-    (void)device;
     (void)flags;
 
-    client = current_client();
+    client = current_client(device);
     if (client == NULL)
         return 0;
     if (client->streaming)
@@ -632,10 +687,12 @@ v4l_close_impl(struct cuse_dev *device, int flags)
     free_buffers_locked(client);
     pthread_mutex_unlock(&app.camera_lock);
     pthread_mutex_lock(&app.state_lock);
-    if (app.owner == client)
-        app.owner = NULL;
+    if (app.control_client == client)
+        app.control_client = NULL;
+    if (client->port != NULL && client->port->client == client)
+        client->port->client = NULL;
     pthread_mutex_unlock(&app.state_lock);
-    cuse_dev_set_per_file_handle(app.cuse_device, NULL);
+    cuse_dev_set_per_file_handle(device, NULL);
     free(client);
     return 0;
 }
@@ -645,9 +702,8 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
     void *user_data)
 {
     struct client *client;
-    (void)device;
     (void)flags;
-    client = current_client();
+    client = current_client(device);
     if (client == NULL)
         return ENXIO;
 
@@ -683,19 +739,23 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
     case VIDIOC_G_FMT:
     case VIDIOC_TRY_FMT:
     case VIDIOC_S_FMT:
-        if (client->streaming && command == VIDIOC_S_FMT)
+        if (command == VIDIOC_S_FMT &&
+            (!client->control_owner || client->streaming))
             return EBUSY;
         return forward_ioctl(user_data, command, sizeof(struct v4l2_format),
             command == VIDIOC_S_FMT || command == VIDIOC_TRY_FMT);
     case VIDIOC_G_PARM:
     case VIDIOC_S_PARM:
-        if (client->streaming && command == VIDIOC_S_PARM)
+        if (command == VIDIOC_S_PARM &&
+            (!client->control_owner || client->streaming))
             return EBUSY;
         return forward_ioctl(user_data, command, sizeof(struct v4l2_streamparm), false);
     case VIDIOC_CROPCAP:
         return forward_ioctl(user_data, command, sizeof(struct v4l2_cropcap), false);
     case VIDIOC_G_CROP:
     case VIDIOC_S_CROP:
+        if (command == VIDIOC_S_CROP && !client->control_owner)
+            return EBUSY;
         return forward_ioctl(user_data, command, sizeof(struct v4l2_crop), false);
     case VIDIOC_QUERYCTRL:
         return query_forwarded_control(user_data, command,
@@ -711,11 +771,15 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
             return result;
         if (!is_forwarded_control(control.id))
             return EINVAL;
+        if (command == VIDIOC_S_CTRL && !client->control_owner)
+            return EBUSY;
         return forward_ioctl(user_data, command, sizeof(control), false);
     }
     case VIDIOC_G_EXT_CTRLS:
     case VIDIOC_S_EXT_CTRLS:
     case VIDIOC_TRY_EXT_CTRLS:
+        if (command != VIDIOC_G_EXT_CTRLS && !client->control_owner)
+            return EBUSY;
         return forward_extended_controls(user_data, command);
     case VIDIOC_REQBUFS: {
         struct v4l2_requestbuffers request;
@@ -786,6 +850,10 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
             return result;
         if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
             return EINVAL;
+        if (!client->control_owner) {
+            client->streaming = true;
+            return 0;
+        }
         return start_source(client);
     }
     case VIDIOC_STREAMOFF: {
@@ -795,6 +863,10 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
             return result;
         if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
             return EINVAL;
+        if (!client->control_owner) {
+            client->streaming = false;
+            return 0;
+        }
         stop_source(client);
         return 0;
     }
@@ -808,9 +880,8 @@ v4l_poll_impl(struct cuse_dev *device, int flags, int events)
 {
     struct client *client;
     int result = 0;
-    (void)device;
     (void)flags;
-    client = current_client();
+    client = current_client(device);
     if (client == NULL)
         return POLLERR;
     pthread_mutex_lock(&app.state_lock);
@@ -1050,6 +1121,7 @@ main(int argc, char **argv)
     pthread_t cuse_thread;
     struct sigaction action;
     int result;
+    unsigned int port_index;
 
     if (argc != 2) {
         usage(argv[0]);
@@ -1073,21 +1145,32 @@ main(int argc, char **argv)
         (void)close(app.camera_fd);
         return 1;
     }
-    app.cuse_device = cuse_dev_create(&v4l_methods, NULL, NULL, geteuid(),
-        getegid(), 0660, V4LLIVE_NODE);
-    if (app.cuse_device == NULL) {
-        fprintf(stderr, "%s: could not create /dev/%s\n", V4LLIVE_NAME,
-            V4LLIVE_NODE);
-        (void)cuse_uninit();
-        (void)close(app.camera_fd);
-        return 1;
+    for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index) {
+        char name[32];
+        app.ports[port_index].index = port_index;
+        (void)snprintf(name, sizeof(name), "video_live%u", port_index);
+        app.ports[port_index].device = cuse_dev_create(&v4l_methods,
+            &app.ports[port_index], NULL, geteuid(), getegid(), 0660, "%s",
+            name);
+        if (app.ports[port_index].device == NULL) {
+            fprintf(stderr, "%s: could not create /dev/%s\n", V4LLIVE_NAME,
+                name);
+            while (port_index > 0) {
+                --port_index;
+                cuse_dev_destroy(app.ports[port_index].device);
+            }
+            (void)cuse_uninit();
+            (void)close(app.camera_fd);
+            return 1;
+        }
     }
     if (pthread_create(&capture_thread, NULL, capture_worker, NULL) != 0 ||
         pthread_create(&cuse_thread, NULL, cuse_worker, NULL) != 0) {
         fprintf(stderr, "%s: cannot start worker threads\n", V4LLIVE_NAME);
         stop_requested = 1;
         app.stop = true;
-        cuse_dev_destroy(app.cuse_device);
+        for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index)
+            cuse_dev_destroy(app.ports[port_index].device);
         (void)cuse_uninit();
         (void)close(app.camera_fd);
         return 1;
@@ -1103,7 +1186,8 @@ main(int argc, char **argv)
     app.stop = true;
     pthread_cond_broadcast(&app.state_changed);
     pthread_mutex_unlock(&app.state_lock);
-    cuse_dev_destroy(app.cuse_device);
+    for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index)
+        cuse_dev_destroy(app.ports[port_index].device);
     (void)pthread_kill(cuse_thread, SIGUSR1);
     (void)pthread_join(capture_thread, NULL);
     (void)pthread_join(cuse_thread, NULL);

@@ -23,6 +23,23 @@ The application is foreground-only. Closing its X11 window removes the virtual
 node and releases the physical camera. It supports YUYV and forwards format,
 frame interval, exposure, and white-balance requests to the physical device.
 
+## Background monitoring build
+
+Build the no-window monitoring service with four virtual ports (or choose a
+different compile-time count):
+
+```sh
+make clean
+make BACKGROUND=1 BACKGROUND_PORTS=4
+sudo ./v4lliveview /dev/video0
+```
+
+This creates `/dev/video_live0` through `/dev/video_live3`. The first client
+to open any port is the camera-control owner. Later ports are newest-frame
+monitors: they may queue, stream, and dequeue frames, but cannot change format,
+frame interval, exposure, or white balance. When the control owner closes, a
+new opener becomes the next control owner.
+
 ## Scope and safety
 
 The first opener owns the virtual device. Frames are intentionally dropped when

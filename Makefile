@@ -3,7 +3,8 @@ SRCS= src/v4lliveview.c
 MAN=
 
 .if defined(BACKGROUND)
-CFLAGS+= -DV4LLIVEVIEW_BACKGROUND
+BACKGROUND_PORTS?= 4
+CFLAGS+= -DV4LLIVEVIEW_BACKGROUND -DV4LLIVEVIEW_PORTS=${BACKGROUND_PORTS}
 .endif
 
 CFLAGS+= -I/usr/local/include -std=c11 -Wall -Wextra -Wpedantic -Werror \

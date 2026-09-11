@@ -196,12 +196,12 @@ buffers, destroy the X window, remove the output node.
 * command-line configuration beyond physical source path (and later optional
   output-node path).
 
-The later background-service build is selected by a compiler flag.  It has no
-X11 window and may create multiple virtual nodes from the one physical camera.
-The first successful opener is the control owner for format, parameter, and
-control changes until it closes.  Other virtual nodes are monitoring consumers
-and receive only the newest frame for their queued buffers.  That multi-port
-arbitration is future work, not a hidden behaviour of the first build.
+The background-service build is selected by a compiler flag.  It has no X11
+window and creates a configured number of virtual nodes from one physical
+camera.  The first successful opener is the control owner for format,
+parameter, and control changes until it closes.  Other virtual nodes are
+monitoring consumers and receive only the newest frame for their queued
+buffers.  When the owner closes, the next new opener becomes control owner.
 
 ## Acceptance plan
 
