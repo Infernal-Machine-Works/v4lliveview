@@ -59,6 +59,7 @@ struct application {
     pthread_mutex_t state_lock;
     pthread_cond_t state_changed;
     struct client *control_client;
+    struct client *capture_client;
     bool source_streaming;
     bool source_lost;
     bool stop;
@@ -263,10 +264,22 @@ start_source(struct client *client)
 {
     unsigned int index;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    struct v4l2_format format;
 
     if (!client->control_owner || client->count == 0)
         return EINVAL;
     pthread_mutex_lock(&app.camera_lock);
+    memset(&format, 0, sizeof(format));
+    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(app.camera_fd, VIDIOC_G_FMT, &format) == -1) {
+        int error = errno;
+        pthread_mutex_unlock(&app.camera_lock);
+        return error;
+    }
+    if (!is_yuyv(&format) || format.fmt.pix.bytesperline == 0) {
+        pthread_mutex_unlock(&app.camera_lock);
+        return EINVAL;
+    }
     for (index = 0; index < client->count; ++index) {
         struct v4l2_buffer buffer;
         memset(&buffer, 0, sizeof(buffer));
@@ -288,6 +301,9 @@ start_source(struct client *client)
     client->streaming = true;
     app.source_streaming = true;
     app.source_lost = false;
+    app.display_width = format.fmt.pix.width;
+    app.display_height = format.fmt.pix.height;
+    app.display_stride = format.fmt.pix.bytesperline;
     pthread_cond_broadcast(&app.state_changed);
     pthread_mutex_unlock(&app.state_lock);
     pthread_mutex_unlock(&app.camera_lock);
@@ -317,21 +333,14 @@ stop_source(struct client *client)
 static void
 copy_for_display(const uint8_t *pixels, size_t bytes, const struct v4l2_buffer *buffer)
 {
-    struct v4l2_format format;
     uint8_t *new_pixels;
 
-    memset(&format, 0, sizeof(format));
-    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    pthread_mutex_lock(&app.camera_lock);
-    if (xioctl(app.camera_fd, VIDIOC_G_FMT, &format) == -1) {
-        pthread_mutex_unlock(&app.camera_lock);
+    pthread_mutex_lock(&app.state_lock);
+    if (app.display_width == 0 || app.display_height == 0 ||
+        app.display_stride == 0) {
+        pthread_mutex_unlock(&app.state_lock);
         return;
     }
-    pthread_mutex_unlock(&app.camera_lock);
-    if (!is_yuyv(&format))
-        return;
-
-    pthread_mutex_lock(&app.state_lock);
     if (app.display_size != bytes) {
         new_pixels = realloc(app.display_yuyv, bytes);
         if (new_pixels == NULL) {
@@ -343,10 +352,17 @@ copy_for_display(const uint8_t *pixels, size_t bytes, const struct v4l2_buffer *
         app.display_size = bytes;
     }
     memcpy(app.display_yuyv, pixels, bytes);
-    app.display_width = format.fmt.pix.width;
-    app.display_height = format.fmt.pix.height;
-    app.display_stride = format.fmt.pix.bytesperline;
     app.display_sequence = buffer->sequence;
+    pthread_cond_broadcast(&app.state_changed);
+    pthread_mutex_unlock(&app.state_lock);
+}
+
+static void
+release_capture_client(struct client *client)
+{
+    pthread_mutex_lock(&app.state_lock);
+    if (app.capture_client == client)
+        app.capture_client = NULL;
     pthread_cond_broadcast(&app.state_changed);
     pthread_mutex_unlock(&app.state_lock);
 }
@@ -370,6 +386,7 @@ capture_worker(void *unused)
             break;
         }
         client = app.control_client;
+        app.capture_client = client;
         pthread_mutex_unlock(&app.state_lock);
         if (client == NULL)
             continue;
@@ -378,8 +395,10 @@ capture_worker(void *unused)
         source_poll.events = POLLIN;
         source_poll.revents = 0;
         poll_result = poll(&source_poll, 1, 100);
-        if (poll_result <= 0)
+        if (poll_result <= 0) {
+            release_capture_client(client);
             continue;
+        }
 
         memset(&source_buffer, 0, sizeof(source_buffer));
         source_buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -395,6 +414,7 @@ capture_worker(void *unused)
                 pthread_mutex_unlock(&app.state_lock);
                 cuse_poll_wakeup();
             }
+            release_capture_client(client);
             continue;
         }
         pthread_mutex_unlock(&app.camera_lock);
@@ -440,6 +460,7 @@ capture_worker(void *unused)
         pthread_mutex_lock(&app.camera_lock);
         (void)xioctl(app.camera_fd, VIDIOC_QBUF, &source_buffer);
         pthread_mutex_unlock(&app.camera_lock);
+        release_capture_client(client);
         cuse_poll_wakeup();
     }
     return NULL;
@@ -683,6 +704,10 @@ v4l_close_impl(struct cuse_dev *device, int flags)
         return 0;
     if (client->streaming)
         stop_source(client);
+    pthread_mutex_lock(&app.state_lock);
+    while (app.capture_client == client)
+        (void)pthread_cond_wait(&app.state_changed, &app.state_lock);
+    pthread_mutex_unlock(&app.state_lock);
     pthread_mutex_lock(&app.camera_lock);
     free_buffers_locked(client);
     pthread_mutex_unlock(&app.camera_lock);
@@ -995,14 +1020,13 @@ yuyv_pixel(uint8_t y, uint8_t u, uint8_t v)
 
 static void
 draw_latest(Display *display, Window window, GC graphics,
-    uint8_t **scratch, size_t *scratch_size)
+    uint8_t **scratch, size_t *scratch_size, XImage **image)
 {
     unsigned int width;
     unsigned int height;
     unsigned int stride;
     size_t source_size;
     size_t output_size;
-    XImage *image;
 
     pthread_mutex_lock(&app.state_lock);
     width = app.display_width;
@@ -1012,6 +1036,14 @@ draw_latest(Display *display, Window window, GC graphics,
     if (width == 0 || height == 0 || app.display_yuyv == NULL) {
         pthread_mutex_unlock(&app.state_lock);
         return;
+    }
+    if (*image != NULL &&
+        ((unsigned int)(*image)->width != width ||
+        (unsigned int)(*image)->height != height)) {
+        (*image)->data = NULL;
+        XDestroyImage(*image);
+        *image = NULL;
+        XResizeWindow(display, window, width, height);
     }
     output_size = (size_t)width * height * sizeof(uint32_t);
     if (*scratch_size != output_size) {
@@ -1039,14 +1071,15 @@ draw_latest(Display *display, Window window, GC graphics,
     }
     pthread_mutex_unlock(&app.state_lock);
 
-    image = XCreateImage(display, DefaultVisual(display, DefaultScreen(display)),
-        DefaultDepth(display, DefaultScreen(display)), ZPixmap, 0,
-        (char *)*scratch, width, height, 32, 0);
-    if (image == NULL)
-        return;
-    XPutImage(display, window, graphics, image, 0, 0, 0, 0, width, height);
-    image->data = NULL;
-    XDestroyImage(image);
+    if (*image == NULL) {
+        *image = XCreateImage(display,
+            DefaultVisual(display, DefaultScreen(display)),
+            DefaultDepth(display, DefaultScreen(display)), ZPixmap, 0,
+            (char *)*scratch, width, height, 32, 0);
+        if (*image == NULL)
+            return;
+    }
+    XPutImage(display, window, graphics, *image, 0, 0, 0, 0, width, height);
     XFlush(display);
 }
 
@@ -1059,6 +1092,7 @@ run_x11(void)
     GC graphics;
     uint8_t *scratch = NULL;
     size_t scratch_size = 0;
+    XImage *image = NULL;
 
     display = XOpenDisplay(NULL);
     if (display == NULL) {
@@ -1085,11 +1119,15 @@ run_x11(void)
                 break;
             }
         }
-        draw_latest(display, window, graphics, &scratch, &scratch_size);
+        draw_latest(display, window, graphics, &scratch, &scratch_size, &image);
         struct timespec interval = { .tv_sec = 0, .tv_nsec = 16000000L };
         (void)nanosleep(&interval, NULL);
     }
 
+    if (image != NULL) {
+        image->data = NULL;
+        XDestroyImage(image);
+    }
     free(scratch);
     XFreeGC(display, graphics);
     XDestroyWindow(display, window);
