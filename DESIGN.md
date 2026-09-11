@@ -2,9 +2,10 @@
 
 ## Purpose
 
-`v4lliveview` is one local FreeBSD C program plus a small local kernel module.
-Together they own one physical Video4Linux camera, transparently proxy a host
-application's V4L2 session, and tee each captured frame to:
+`v4lliveview` is one local FreeBSD C program using FreeBSD's supplied CUSE
+kernel module.  Together they own one physical Video4Linux camera,
+transparently proxy a host application's V4L2 session, and tee each captured
+frame to:
 
 1. an unmodified third-party V4L2 capture application opening a new virtual
    `/dev/videoN` node; and
@@ -122,24 +123,12 @@ Initially allow one virtual capture client; a second opener fails with
 `EBUSY`.  This preserves ordinary V4L2 buffer ownership and keeps the first
 milestone testable.  Multi-client virtual capture can be designed later.
 
-The virtual V4L2 backend is a small FreeBSD kernel module.  It is required to
-provide genuine MMAP streaming/poll semantics while forwarding the active host
-application's sequence to the exclusive physical camera owner.  The foreground
-Xlib program owns physical capture and the current frame; the module owns the
-cdev, per-open V4L2 state, virtual MMAP buffers, and poll/select wakeups.
-Define the module/program boundary with a narrow, versioned kernel-private
-interface.
-
-CUSE may still be used only as a disposable protocol-learning spike.  It is
-not a delivery backend unless it demonstrates the exact host-application
-MMAP, `select(2)`, dequeue, and requeue sequence on this FreeBSD host.
-
-<!-- Historical alternatives retained for rationale. -->
-
-| Candidate | Shape | Main benefit | Main risk |
-| --- | --- | --- | --- |
-| FreeBSD kernel module (selected) | a real cdev with V4L2 ioctl/mmap/poll semantics | exact simplepycam MMAP contract | privileged install, kernel ABI/testing burden |
-| CUSE spike only | user-space cdev experiment | lower-cost protocol exploration | not accepted as product proof without an exact client pass |
+The virtual V4L2 backend uses FreeBSD CUSE.  Its installed kernel module
+provides real character-device, MMAP, and poll semantics; the foreground C
+program implements per-open V4L2 state and supplies CUSE-backed virtual
+buffers.  It remains a genuine device node while avoiding a custom privileged
+kernel driver.  CUSE must still pass the exact host-application MMAP,
+`select(2)`, dequeue, and requeue sequence on this FreeBSD host.
 
 Do not ship a partial node that merely works with `v4l2-ctl`.
 

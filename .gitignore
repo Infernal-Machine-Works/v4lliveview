@@ -1,0 +1,8 @@
+.depend
+.depend.*
+*.o
+*.bc
+*.ll
+*.full
+*.debug
+/v4lliveview

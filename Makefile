@@ -1,0 +1,14 @@
+PROG= v4lliveview
+SRCS= src/v4lliveview.c
+MAN=
+
+.if defined(BACKGROUND)
+CFLAGS+= -DV4LLIVEVIEW_BACKGROUND
+.endif
+
+CFLAGS+= -I/usr/local/include -std=c11 -Wall -Wextra -Wpedantic -Werror \
+    -Wno-c11-extensions -O2
+LDFLAGS+= -L/usr/local/lib
+LDADD+= -lcuse -lX11 -lXext -lpthread
+
+.include <bsd.prog.mk>
