@@ -168,9 +168,8 @@ orderly shutdown.  The virtual node exists only while the program is running;
 a simplepycam client may attach at any time after it appears.
 
 Virtual nodes are mode `0660` and inherit the daemon's effective owner and
-group at creation.  The program should open the physical device while
-privileged only when necessary, create the virtual node, then drop privileges.
-No network listener or control socket is in scope.
+group at creation.  The daemon account must be permitted to open `/dev/cuse`
+and the physical device. No network listener or control socket is in scope.
 
 On source unplug, dequeue/ioctl failure, or format change, the program wakes
 the virtual client and ends streaming with the physical-camera error.  It never
@@ -231,7 +230,7 @@ buffers.  When the owner closes, the next new opener becomes control owner.
 ## Resolved decisions
 
 * The first opener is the camera-control owner until it closes; later virtual
-  ports in the future background build are monitoring-only.
+  ports in the background build are monitoring-only.
 * If a client has no queued buffer, its frame is dropped and the physical
   buffer is immediately requeued.  Low latency takes priority over delivery.
 * Virtual nodes are mode `0660` and use the daemon's owner and group.
