@@ -23,6 +23,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef V4LLIVEVIEW_BACKGROUND
+#include <jpeglib.h>
+#include <setjmp.h>
+#endif
 
 #define V4LLIVE_NAME "v4lliveview"
 #define MAX_BUFFERS 32U
@@ -70,6 +74,10 @@ struct application {
     unsigned int display_width;
     unsigned int display_height;
     unsigned int display_stride;
+    uint32_t display_format;
+    uint64_t display_generation;
+    unsigned int capture_width, capture_height, capture_stride;
+    uint32_t capture_format;
     uint64_t display_sequence;
     unsigned long display_drops;
     unsigned long client_drops;
@@ -103,10 +111,11 @@ request_stop(int signal_number)
 }
 
 static bool
-is_yuyv(const struct v4l2_format *format)
+is_supported_format(const struct v4l2_format *format)
 {
     return format->type == V4L2_BUF_TYPE_VIDEO_CAPTURE &&
-        format->fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV;
+        (format->fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV ||
+        format->fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG);
 }
 
 static bool
@@ -181,7 +190,7 @@ allocate_buffers(struct client *client, struct v4l2_requestbuffers *request)
             return error;
         }
         pthread_mutex_unlock(&app.camera_lock);
-        if (!is_yuyv(&format) || format.fmt.pix.sizeimage == 0)
+        if (!is_supported_format(&format) || format.fmt.pix.sizeimage == 0)
             return EINVAL;
         for (unsigned int index = 0; index < request->count; ++index) {
             client->buffers[index].virtual = cuse_vmalloc(format.fmt.pix.sizeimage);
@@ -276,7 +285,8 @@ start_source(struct client *client)
         pthread_mutex_unlock(&app.camera_lock);
         return error;
     }
-    if (!is_yuyv(&format) || format.fmt.pix.bytesperline == 0) {
+    if (!is_supported_format(&format) ||
+        (format.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV && format.fmt.pix.bytesperline == 0)) {
         pthread_mutex_unlock(&app.camera_lock);
         return EINVAL;
     }
@@ -301,9 +311,10 @@ start_source(struct client *client)
     client->streaming = true;
     app.source_streaming = true;
     app.source_lost = false;
-    app.display_width = format.fmt.pix.width;
-    app.display_height = format.fmt.pix.height;
-    app.display_stride = format.fmt.pix.bytesperline;
+    app.capture_width = format.fmt.pix.width;
+    app.capture_height = format.fmt.pix.height;
+    app.capture_stride = format.fmt.pix.bytesperline;
+    app.capture_format = format.fmt.pix.pixelformat;
     pthread_cond_broadcast(&app.state_changed);
     pthread_mutex_unlock(&app.state_lock);
     pthread_mutex_unlock(&app.camera_lock);
@@ -336,8 +347,10 @@ copy_for_display(const uint8_t *pixels, size_t bytes, const struct v4l2_buffer *
     uint8_t *new_pixels;
 
     pthread_mutex_lock(&app.state_lock);
-    if (app.display_width == 0 || app.display_height == 0 ||
-        app.display_stride == 0) {
+    if (app.capture_width == 0 || app.capture_height == 0 ||
+        (buffer->flags & V4L2_BUF_FLAG_ERROR) || bytes == 0 ||
+        (app.capture_format == V4L2_PIX_FMT_YUYV &&
+        (app.capture_stride == 0 || bytes < (size_t)app.capture_stride * app.capture_height))) {
         pthread_mutex_unlock(&app.state_lock);
         return;
     }
@@ -353,6 +366,11 @@ copy_for_display(const uint8_t *pixels, size_t bytes, const struct v4l2_buffer *
     }
     memcpy(app.display_yuyv, pixels, bytes);
     app.display_sequence = buffer->sequence;
+    app.display_width = app.capture_width;
+    app.display_height = app.capture_height;
+    app.display_stride = app.capture_stride;
+    app.display_format = app.capture_format;
+    ++app.display_generation;
     pthread_cond_broadcast(&app.state_changed);
     pthread_mutex_unlock(&app.state_lock);
 }
@@ -447,6 +465,8 @@ capture_worker(void *unused)
                 destination->metadata = source_buffer;
                 destination->metadata.index = target;
                 destination->metadata.bytesused = bytes;
+                if (bytes != source_buffer.bytesused)
+                    destination->metadata.flags |= V4L2_BUF_FLAG_ERROR;
                 destination->ready = true;
                 destination->queued = false;
             }
@@ -496,7 +516,7 @@ forward_ioctl(void *user_data, unsigned long command, size_t size,
     result = copy_in(local, user_data, size);
     if (result != 0)
         return result;
-    if (require_yuyv && !is_yuyv((struct v4l2_format *)local))
+    if (require_yuyv && !is_supported_format((struct v4l2_format *)local))
         return EINVAL;
     pthread_mutex_lock(&app.camera_lock);
     result = xioctl(app.camera_fd, command, local);
@@ -507,7 +527,7 @@ forward_ioctl(void *user_data, unsigned long command, size_t size,
     pthread_mutex_unlock(&app.camera_lock);
     if (result != 0)
         return result;
-    if (require_yuyv && !is_yuyv((struct v4l2_format *)local))
+    if (require_yuyv && !is_supported_format((struct v4l2_format *)local))
         return EINVAL;
     return copy_out(local, user_data, size);
 }
@@ -538,7 +558,8 @@ enumerate_yuyv(void *user_data)
         pthread_mutex_unlock(&app.camera_lock);
         if (result != 0)
             return result;
-        if (candidate.pixelformat != V4L2_PIX_FMT_YUYV)
+        if (candidate.pixelformat != V4L2_PIX_FMT_YUYV &&
+            candidate.pixelformat != V4L2_PIX_FMT_MJPEG)
             continue;
         if (found++ != wanted)
             continue;
@@ -550,13 +571,20 @@ enumerate_yuyv(void *user_data)
 static int
 enumerate_yuyv_sizes(void *user_data, unsigned long command, size_t size)
 {
-    uint8_t local[sizeof(struct v4l2_frmsizeenum)];
+    union {
+        struct v4l2_frmsizeenum sizes;
+        struct v4l2_frmivalenum intervals;
+    } storage;
+    void *local = &storage;
     int result;
 
+    if (size > sizeof(storage))
+        return EINVAL;
     result = copy_in(local, user_data, size);
     if (result != 0)
         return result;
-    if (((struct v4l2_frmsizeenum *)local)->pixel_format != V4L2_PIX_FMT_YUYV)
+    if (((struct v4l2_frmsizeenum *)local)->pixel_format != V4L2_PIX_FMT_YUYV &&
+        ((struct v4l2_frmsizeenum *)local)->pixel_format != V4L2_PIX_FMT_MJPEG)
         return EINVAL;
     pthread_mutex_lock(&app.camera_lock);
     result = xioctl(app.camera_fd, command, local);
@@ -753,6 +781,14 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
         capability.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
         return copy_out(&capability, user_data, sizeof(capability));
     }
+    case VIDIOC_G_INPUT:
+        return forward_ioctl(user_data, command, sizeof(int), false);
+    case VIDIOC_ENUMINPUT:
+        return forward_ioctl(user_data, command, sizeof(struct v4l2_input), false);
+    case VIDIOC_S_INPUT:
+        if (!client->control_owner || client->streaming)
+            return EBUSY;
+        return forward_ioctl(user_data, command, sizeof(int), false);
     case VIDIOC_ENUM_FMT:
         return enumerate_yuyv(user_data);
     case VIDIOC_ENUM_FRAMESIZES:
@@ -1002,6 +1038,67 @@ cuse_worker(void *unused)
 }
 
 #ifndef V4LLIVEVIEW_BACKGROUND
+struct preview_jpeg_error {
+    struct jpeg_error_mgr base;
+    jmp_buf escape;
+};
+
+static void
+preview_jpeg_fail(j_common_ptr decoder)
+{
+    struct preview_jpeg_error *error = (void *)decoder->err;
+    longjmp(error->escape, 1);
+}
+
+static bool
+jpeg_preview(const uint8_t *source, size_t bytes, unsigned int width,
+    unsigned int height, unsigned int scale, unsigned int out_width,
+    unsigned int out_height, uint32_t *destination)
+{
+    struct jpeg_decompress_struct decoder;
+    struct preview_jpeg_error error;
+    memset(&decoder, 0, sizeof(decoder));
+    decoder.err = jpeg_std_error(&error.base);
+    error.base.error_exit = preview_jpeg_fail;
+    if (setjmp(error.escape)) {
+        jpeg_destroy_decompress(&decoder);
+        return false;
+    }
+    jpeg_create_decompress(&decoder);
+    jpeg_mem_src(&decoder, source, bytes);
+    (void)jpeg_read_header(&decoder, TRUE);
+    if (decoder.image_width != width || decoder.image_height != height) {
+        jpeg_destroy_decompress(&decoder);
+        return false;
+    }
+    decoder.out_color_space = JCS_RGB;
+    decoder.scale_num = 1;
+    decoder.scale_denom = scale;
+    (void)jpeg_start_decompress(&decoder);
+    if (decoder.output_components != 3 || decoder.output_width != out_width ||
+        decoder.output_height != out_height) {
+        jpeg_destroy_decompress(&decoder);
+        return false;
+    }
+    JSAMPARRAY row = (*decoder.mem->alloc_sarray)((j_common_ptr)&decoder,
+        JPOOL_IMAGE, out_width * 3, 1);
+    while (decoder.output_scanline < out_height) {
+        unsigned int y = decoder.output_scanline;
+        if (jpeg_read_scanlines(&decoder, row, 1) != 1) {
+            jpeg_destroy_decompress(&decoder);
+            return false;
+        }
+        for (unsigned int x = 0; x < out_width; ++x)
+            destination[(size_t)y * out_width + x] =
+                ((uint32_t)row[0][x * 3] << 16) |
+                ((uint32_t)row[0][x * 3 + 1] << 8) | row[0][x * 3 + 2];
+    }
+    (void)jpeg_finish_decompress(&decoder);
+    bool valid = decoder.err->num_warnings == 0;
+    jpeg_destroy_decompress(&decoder);
+    return valid;
+}
+
 static uint32_t
 yuyv_pixel(uint8_t y, uint8_t u, uint8_t v)
 {
@@ -1020,67 +1117,98 @@ yuyv_pixel(uint8_t y, uint8_t u, uint8_t v)
 
 static void
 draw_latest(Display *display, Window window, GC graphics,
-    uint8_t **scratch, size_t *scratch_size, XImage **image)
+    uint8_t **scratch, size_t *scratch_size, XImage **image, bool redraw)
 {
-    unsigned int width;
-    unsigned int height;
-    unsigned int stride;
-    size_t source_size;
-    size_t output_size;
+    static uint64_t last_generation;
+    unsigned int width, height, stride, format, scale = 1;
+    size_t bytes;
+    uint64_t generation;
+    uint8_t *source = NULL;
 
     pthread_mutex_lock(&app.state_lock);
+    generation = app.display_generation;
+    if (generation == 0 || generation == last_generation) {
+        pthread_mutex_unlock(&app.state_lock);
+        if (!redraw)
+            return;
+        goto paint_cached;
+    }
     width = app.display_width;
     height = app.display_height;
     stride = app.display_stride;
-    source_size = app.display_size;
-    if (width == 0 || height == 0 || app.display_yuyv == NULL) {
-        pthread_mutex_unlock(&app.state_lock);
-        return;
-    }
-    if (*image != NULL &&
-        ((unsigned int)(*image)->width != width ||
-        (unsigned int)(*image)->height != height)) {
-        (*image)->data = NULL;
-        XDestroyImage(*image);
-        *image = NULL;
-        XResizeWindow(display, window, width, height);
-    }
-    output_size = (size_t)width * height * sizeof(uint32_t);
-    if (*scratch_size != output_size) {
-        uint8_t *replacement = realloc(*scratch, output_size);
-        if (replacement == NULL) {
-            pthread_mutex_unlock(&app.state_lock);
-            return;
-        }
-        *scratch = replacement;
-        *scratch_size = output_size;
-    }
-    for (unsigned int row = 0; row < height; ++row) {
-        const uint8_t *source = app.display_yuyv + (size_t)row * stride;
-        uint32_t *destination = (uint32_t *)(void *)(*scratch) + (size_t)row * width;
-        if ((size_t)(row + 1) * stride > source_size)
-            break;
-        for (unsigned int column = 0; column + 1 < width; column += 2) {
-            uint8_t y0 = source[column * 2];
-            uint8_t u = source[column * 2 + 1];
-            uint8_t y1 = source[column * 2 + 2];
-            uint8_t v = source[column * 2 + 3];
-            destination[column] = yuyv_pixel(y0, u, v);
-            destination[column + 1] = yuyv_pixel(y1, u, v);
-        }
+    format = app.display_format;
+    bytes = app.display_size;
+    if (bytes && width && height && width <= 16384 && height <= 16384) {
+        source = malloc(bytes);
+        if (source != NULL)
+            memcpy(source, app.display_yuyv, bytes);
     }
     pthread_mutex_unlock(&app.state_lock);
+    if (source == NULL)
+        goto paint_cached;
 
-    if (*image == NULL) {
-        *image = XCreateImage(display,
-            DefaultVisual(display, DefaultScreen(display)),
-            DefaultDepth(display, DefaultScreen(display)), ZPixmap, 0,
-            (char *)*scratch, width, height, 32, 0);
-        if (*image == NULL)
-            return;
+    /* Never decode or perform X11 calls while holding the acquisition lock. */
+    while (scale < 8 && ((width + scale - 1) / scale > 960 ||
+        (height + scale - 1) / scale > 720))
+        scale *= 2;
+    unsigned int out_width = (width + scale - 1) / scale;
+    unsigned int out_height = (height + scale - 1) / scale;
+    size_t output_size = (size_t)out_width * out_height * sizeof(uint32_t);
+    uint32_t *pixels = malloc(output_size);
+    bool valid = pixels != NULL;
+    if (valid && format == V4L2_PIX_FMT_MJPEG) {
+        valid = jpeg_preview(source, bytes, width, height, scale,
+            out_width, out_height, pixels);
+    } else if (valid && format == V4L2_PIX_FMT_YUYV && width % 2 == 0 &&
+        stride >= width * 2 && bytes >= (size_t)stride * height) {
+        for (unsigned int y = 0; y < out_height; ++y) {
+            const uint8_t *row = source + (size_t)(y * scale) * stride;
+            for (unsigned int x = 0; x < out_width; ++x) {
+                unsigned int sx = x * scale;
+                unsigned int pair = (sx / 2) * 4;
+                pixels[(size_t)y * out_width + x] = yuyv_pixel(
+                    row[sx * 2], row[pair + 1], row[pair + 3]);
+            }
+        }
+    } else {
+        valid = false;
     }
-    XPutImage(display, window, graphics, *image, 0, 0, 0, 0, width, height);
-    XFlush(display);
+    free(source);
+    last_generation = generation;
+    if (!valid) {
+        free(pixels);
+        goto paint_cached;
+    }
+
+    XImage *replacement = XCreateImage(display,
+        DefaultVisual(display, DefaultScreen(display)),
+        DefaultDepth(display, DefaultScreen(display)), ZPixmap, 0,
+        (char *)pixels, out_width, out_height, 32, 0);
+    if (replacement == NULL) {
+        free(pixels);
+        goto paint_cached;
+    }
+    bool resized = *image == NULL || (*image)->width != (int)out_width ||
+        (*image)->height != (int)out_height;
+    if (*image != NULL) {
+        (*image)->data = NULL;
+        XDestroyImage(*image);
+    }
+    free(*scratch);
+    *scratch = (uint8_t *)pixels;
+    *scratch_size = output_size;
+    *image = replacement;
+    if (resized)
+        XResizeWindow(display, window, out_width, out_height);
+
+paint_cached:
+    /* The decoded image belongs to the GUI, not the capture client's buffers.
+     * Close, STREAMOFF, malformed new frames and Expose retain/repaint it. */
+    if (*image != NULL) {
+        XPutImage(display, window, graphics, *image, 0, 0, 0, 0,
+            (*image)->width, (*image)->height);
+        XFlush(display);
+    }
 }
 
 static int
@@ -1110,16 +1238,19 @@ run_x11(void)
     XMapWindow(display, window);
 
     while (!stop_requested) {
+        bool redraw = false;
         while (XPending(display) > 0) {
             XEvent event;
             XNextEvent(display, &event);
+            if (event.type == Expose || event.type == ConfigureNotify)
+                redraw = true;
             if (event.type == ClientMessage &&
                 (Atom)event.xclient.data.l[0] == delete_window) {
                 stop_requested = 1;
                 break;
             }
         }
-        draw_latest(display, window, graphics, &scratch, &scratch_size, &image);
+        draw_latest(display, window, graphics, &scratch, &scratch_size, &image, redraw);
         struct timespec interval = { .tv_sec = 0, .tv_nsec = 16000000L };
         (void)nanosleep(&interval, NULL);
     }
@@ -1149,7 +1280,7 @@ run_background(void)
 static void
 usage(const char *program)
 {
-    fprintf(stderr, "usage: %s /dev/videoN\n", program);
+    fprintf(stderr, "usage: %s /dev/videoN [first_virtual_port]\n", program);
 }
 
 int
@@ -1160,10 +1291,20 @@ main(int argc, char **argv)
     struct sigaction action;
     int result;
     unsigned int port_index;
+    unsigned long first_port = 0;
 
-    if (argc != 2) {
+    if (argc != 2 && argc != 3) {
         usage(argv[0]);
         return 64;
+    }
+    if (argc == 3) {
+        char *end;
+        errno = 0;
+        first_port = strtoul(argv[2], &end, 10);
+        if (errno || end == argv[2] || *end || first_port > 65535 - V4LLIVEVIEW_PORTS) {
+            usage(argv[0]);
+            return 64;
+        }
     }
     memset(&action, 0, sizeof(action));
     action.sa_handler = request_stop;
@@ -1186,7 +1327,7 @@ main(int argc, char **argv)
     for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index) {
         char name[32];
         app.ports[port_index].index = port_index;
-        (void)snprintf(name, sizeof(name), "video_live%u", port_index);
+        (void)snprintf(name, sizeof(name), "video_live%u", (unsigned int)first_port + port_index);
         app.ports[port_index].device = cuse_dev_create(&v4l_methods,
             &app.ports[port_index], NULL, geteuid(), getegid(), 0660, "%s",
             name);

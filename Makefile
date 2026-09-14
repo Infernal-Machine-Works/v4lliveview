@@ -10,6 +10,6 @@ CFLAGS+= -DV4LLIVEVIEW_BACKGROUND -DV4LLIVEVIEW_PORTS=${BACKGROUND_PORTS}
 CFLAGS+= -I/usr/local/include -std=c11 -Wall -Wextra -Wpedantic -Werror \
     -Wno-c11-extensions -O2
 LDFLAGS+= -L/usr/local/lib
-LDADD+= -lcuse -lX11 -lXext -lpthread
+LDADD+= -lcuse -lX11 -lXext -lpthread -ljpeg
 
 .include <bsd.prog.mk>
