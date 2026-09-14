@@ -1,3 +1,5 @@
+/v4lliveview
+/v4lliveview-background
 .depend
 .depend.*
 *.o
@@ -5,4 +7,4 @@
 *.ll
 *.full
 *.debug
-/v4lliveview
+*.orig

@@ -1,15 +1,23 @@
-PROG= v4lliveview
-SRCS= src/v4lliveview.c
-MAN=
-
-.if defined(BACKGROUND)
+CC?= cc
+CFLAGS?= -O2
+CPPFLAGS+= -I/usr/local/include
+CFLAGS+= -std=c11 -Wall -Wextra -Wpedantic -Werror -Wno-c11-extensions
+LDFLAGS+= -L/usr/local/lib
 BACKGROUND_PORTS?= 4
-CFLAGS+= -DV4LLIVEVIEW_BACKGROUND -DV4LLIVEVIEW_PORTS=${BACKGROUND_PORTS}
+
+.PHONY: all clean
+.if defined(BACKGROUND)
+all: v4lliveview-background
+.else
+all: v4lliveview v4lliveview-background
 .endif
 
-CFLAGS+= -I/usr/local/include -std=c11 -Wall -Wextra -Wpedantic -Werror \
-    -Wno-c11-extensions -O2
-LDFLAGS+= -L/usr/local/lib
-LDADD+= -lcuse -lX11 -lXext -lpthread -ljpeg
+# Separate direct builds prevent stale objects when switching compile modes.
+v4lliveview: src/v4lliveview.c Makefile
+	${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -o ${.TARGET} src/v4lliveview.c -lcuse -lX11 -lXext -ljpeg -lpthread
 
-.include <bsd.prog.mk>
+v4lliveview-background: src/v4lliveview.c Makefile
+	${CC} ${CPPFLAGS} ${CFLAGS} -DV4LLIVEVIEW_BACKGROUND -DV4LLIVEVIEW_PORTS=${BACKGROUND_PORTS} ${LDFLAGS} -o ${.TARGET} src/v4lliveview.c -lcuse -lpthread
+
+clean:
+	rm -f v4lliveview v4lliveview-background

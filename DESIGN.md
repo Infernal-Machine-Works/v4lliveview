@@ -1,3 +1,15 @@
+# Current implementation amendment (2026-09-14)
+
+The design notes below retain the original YUYV-first rationale. The current
+implementation additionally forwards native MJPEG and supports libjpeg-scaled
+foreground previews. The two canonical builds are `v4lliveview` and
+`v4lliveview-background`; optional first-port numbering supports multiple cameras.
+Preview memory is independent of client buffers and survives STREAMOFF/close;
+decoding and X11 work occur outside the acquisition lock. Invalid JPEG previews
+retain the last valid image. The frame-interval proxy uses storage large enough
+for either enumeration structure. Source timestamp flags remain evidence, not
+verified clock semantics; see README.md for the observed driver inconsistency.
+
 # v4lliveview — design proposal
 
 ## Purpose

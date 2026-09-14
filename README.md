@@ -1,53 +1,78 @@
 # v4lliveview
 
-FreeBSD V4L2 camera tee with a direct Xlib live window.  It creates a virtual
-V4L2 MMAP capture node using the supplied `cuse` kernel module, proxies its
-single client to a physical V4L2 device, and shows the newest YUYV frame.
+FreeBSD V4L2 camera tee using [CUSE](https://man.freebsd.org/cgi/man.cgi?query=cuse), with an _optional_ X11 preview. It forwards
+original YUYV or MJPEG camera payloads and original V4L2 buffer metadata without
+recompression. Cameras remain open while the tee process runs; capture clients
+should also keep their stream open for the complete acquisition session.
 
-## Build and run
+## Canonical builds
 
 ```sh
 make
-kldload cuse                 # once, if it is not already loaded
-sudo ./v4lliveview /dev/video0
 ```
 
-The default virtual node is `/dev/video_live0`, mode `0660`, with the owner
-and group of the process that launches it.  Point the client at that node:
+The repository has two executable variants, both built directly from the same
+source with separate compile flags:
 
-```python
-simplepycam.Camera('/dev/video_live0')
-```
+- `v4lliveview`: foreground X11 preview; one virtual port per process.
+- `v4lliveview-background`: no GUI; four virtual ports per process by default.
 
-The application is foreground-only. Closing its X11 window removes the virtual
-node and releases the physical camera. It supports YUYV and forwards format,
-frame interval, exposure, and white-balance requests to the physical device.
+The foreground build uses already-installed CUSE, X11 and libjpeg libraries.
+The background build uses CUSE and pthreads and forwards MJPEG without decoding.
+No build installs dependencies or changes services. `make BACKGROUND=1` builds
+only the background executable. Use `make clean` before changing
+`BACKGROUND_PORTS`, or `make -B BACKGROUND_PORTS=N`.
 
-## Background monitoring build
+## One or two cameras
 
-Build the no-window monitoring service with four virtual ports (or choose a
-different compile-time count):
+Loading cuse if it's not available:
 
 ```sh
-make clean
-make BACKGROUND=1 BACKGROUND_PORTS=4
-sudo ./v4lliveview /dev/video0
+sudo kldload cuse
 ```
 
-This creates `/dev/video_live0` through `/dev/video_live3`. The first client
-to open any port is the camera-control owner. Later ports are newest-frame
-monitors: they may queue, stream, and dequeue frames, but cannot change format,
-frame interval, exposure, or white balance. When the control owner closes, a
-new opener becomes the next control owner.
+With CUSE available to start the camera processes, for example on `/dev/video2` and `/dev/video4`:
 
-## Scope and safety
+```sh
+sudo ./v4lliveview /dev/video2 0
+sudo ./v4lliveview /dev/video4 4
+```
 
-The first opener owns the virtual device. Frames are intentionally dropped when
-the client has no queued virtual buffer or when the X11 window cannot keep up;
-there is no frame queue. Other V4L2 controls and pixel formats are rejected.
+These map the respective physical cameras to `/dev/video_live0` and
+`/dev/video_live4`. The optional final number is the first virtual-port index;
+it defaults to zero. Background processes allocate consecutive ranges, so
+choose non-overlapping ranges (for example 0..3 and 4..7).
 
-`cuse` must be loaded before launch. On this host `/dev/cuse` is restricted to
-the administrator, so the daemon normally needs to be launched through an
-administrator-approved mechanism (the example uses `sudo`). Loading CUSE and
-granting access to the physical camera are administrator actions; the program
-does not invoke privilege escalation or `kldload` itself.
+The first client is the control owner. Additional background ports are monitor
+clients and cannot change format, frame interval or forwarded camera controls.
+Unknown controls remain rejected.
+
+## Preview and capture behavior
+
+The GUI owns a decoded copy of the last valid image. `STREAMOFF` or closing a
+capture client leaves that image visible; exposing the window repaints it.
+A new stream's format does not reinterpret the cached old frame. Damaged JPEG
+frames are rejected without replacing the last valid preview. Closing the GUI
+itself terminates that tee and removes its virtual node.
+
+Preview decoding happens outside the acquisition lock and only for new frames.
+It scales the preview to fit roughly 960x720 using JPEG decoder scaling or `YUYV`
+sampling. Full original capture payloads are unaffected by preview scaling.
+Unselected frames may be dropped when no virtual buffer is queued; this is not
+a recording service. Clients must persist selected observations themselves.
+Oversized/truncated copies are flagged as invalid rather than silently accepted.
+
+`MJPEG` is camera-side lossy compression; higher advertised frame rate does not
+establish scientific equivalence to `YUYV`. On the IW 3000 that has been used
+during development, full-size YUYV advertises 1 fps while 3840x3104 MJPEG
+advertises 15 fps. Actual exposure, scene, host load and recording cost
+may lower delivery rates.
+
+## Timestamp limitation
+
+The tee preserves source timestamps and flags. Tests on the attached cameras
+found epoch-scale timestamps carrying a MONOTONIC flag. The tee does not rewrite
+those timestamps or pretend they are verified exposure times. A control client
+must validate the clock/source contract and distinguish fresh receipt from a
+proven post-action exposure.
+

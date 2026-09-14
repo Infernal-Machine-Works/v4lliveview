@@ -59,6 +59,7 @@ struct port {
 
 struct application {
     int camera_fd;
+    const char *camera_path;
     pthread_mutex_t camera_lock;
     pthread_mutex_t state_lock;
     pthread_cond_t state_changed;
@@ -1230,7 +1231,9 @@ run_x11(void)
     window = XCreateSimpleWindow(display, RootWindow(display, DefaultScreen(display)),
         0, 0, 640, 480, 0, BlackPixel(display, DefaultScreen(display)),
         BlackPixel(display, DefaultScreen(display)));
-    XStoreName(display, window, "v4lliveview");
+    char title[256];
+    (void)snprintf(title, sizeof(title), "v4lliveview - %s", app.camera_path);
+    XStoreName(display, window, title);
     XSelectInput(display, window, ExposureMask | StructureNotifyMask);
     delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
     (void)XSetWMProtocols(display, window, &delete_window, 1);
@@ -1312,6 +1315,7 @@ main(int argc, char **argv)
     (void)sigaction(SIGTERM, &action, NULL);
     (void)sigaction(SIGUSR1, &action, NULL);
 
+    app.camera_path = argv[1];
     app.camera_fd = open(argv[1], O_RDWR | O_NONBLOCK);
     if (app.camera_fd == -1) {
         perror(argv[1]);
