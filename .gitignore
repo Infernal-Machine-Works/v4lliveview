@@ -1,5 +1,6 @@
 /v4lliveview
 /v4lliveview-background
+/v4lliveview-safety
 .depend
 .depend.*
 *.o

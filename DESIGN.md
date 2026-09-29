@@ -246,3 +246,40 @@ buffers.  When the owner closes, the next new opener becomes control owner.
 * If a client has no queued buffer, its frame is dropped and the physical
   buffer is immediately requeued.  Low latency takes priority over delivery.
 * Virtual nodes are mode `0660` and use the daemon's owner and group.
+
+## Headless safety service
+
+`v4lliveview-safety` is a separate headless build with exactly two fixed-role
+virtual ports. The first is the primary V4L2 control client and may attach or
+detach over the service lifetime; the second is a persistent monitoring client
+and can only stream queued buffers. The physical camera file descriptor remains
+open for the daemon lifetime.
+
+While the primary streams, its capture path remains continuous and receives
+every available frame without waiting for monitoring. A monotonic interval gate
+selects at most one ready secondary buffer per configured period. With no
+primary control client, and only when the secondary is streaming with a queued
+buffer, a daemon-owned MMAP transaction obtains one fresh frame:
+`REQBUFS`, queue, `STREAMON`, dequeue, copy, `STREAMOFF`, release. The daemon
+does not invent frames or retain them for a detached secondary. A primary
+configuration waits behind at most the one in-progress idle transaction, then
+owns all camera format and supported-control operations.
+
+
+## Repeated-session MMAP qualification (2026-09-14)
+
+Two successive capture sessions exposed truncated MJPEG payloads after the
+first session succeeded. A process restart cleared the first session only.
+Direct physical-device sampling decoded 200/200 frames per camera. The tee now
+renews its idle physical-camera file handle when the first virtual client opens
+a new session. The handle remains open for every frame in that session, so
+long-running acquisition does not reconnect per image. Cached GUI pixels remain
+independent of the physical handle and survive client close.
+
+After this remedy, two successive 200-frame sessions per camera decoded all
+800 sampled images successfully. A further 60-frame archive/pixel-roundtrip
+matrix passed at HD 640x360 MJPEG and IW3000 3840x3104 MJPEG, including repeated
+open-to-first-frame tests. This is evidence for the session-handle remedy, not
+proof of the exact upstream webcamd/VM remapping cause or scientific camera
+qualification. Source-clock flags on this host remain inconsistent with the
+observed timestamp domain and must not be treated as verified exposure timing.

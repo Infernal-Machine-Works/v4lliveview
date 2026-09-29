@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #ifndef V4LLIVEVIEW_BACKGROUND
 #include <jpeglib.h>
@@ -55,6 +56,7 @@ struct port {
     struct cuse_dev *device;
     struct client *client;
     unsigned int index;
+    unsigned int slot;
 };
 
 struct application {
@@ -65,6 +67,11 @@ struct application {
     pthread_cond_t state_changed;
     struct client *control_client;
     struct client *capture_client;
+#ifdef V4LLIVEVIEW_SAFETY
+    struct client *safety_client;
+    uint64_t safety_interval_ns;
+    uint64_t safety_next_ns;
+#endif
     bool source_streaming;
     bool source_lost;
     bool stop;
@@ -92,6 +99,16 @@ static struct application app = {
 };
 
 static volatile sig_atomic_t stop_requested;
+
+#ifdef V4LLIVEVIEW_SAFETY
+static uint64_t
+monotonic_ns(void)
+{
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;
+}
+#endif
 
 static int
 xioctl(int fd, unsigned long request, void *argument)
@@ -386,6 +403,135 @@ release_capture_client(struct client *client)
     pthread_mutex_unlock(&app.state_lock);
 }
 
+#ifdef V4LLIVEVIEW_SAFETY
+static bool
+safety_secondary_ready_locked(struct client **client_out)
+{
+    struct client *client = app.ports[1].client;
+
+    if (app.control_client != NULL || client == NULL || !client->streaming)
+        return false;
+    for (unsigned int index = 0; index < client->count; ++index) {
+        if (client->buffers[index].queued && !client->buffers[index].ready) {
+            *client_out = client;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+deliver_frame_locked(struct client *client, const void *pixels, size_t bytes,
+    const struct v4l2_buffer *source)
+{
+    for (unsigned int index = 0; index < client->count; ++index) {
+        struct buffer *destination = &client->buffers[index];
+        size_t copied;
+        if (!destination->queued || destination->ready)
+            continue;
+        copied = bytes > destination->length ? destination->length : bytes;
+        memcpy(destination->virtual, pixels, copied);
+        destination->metadata = *source;
+        destination->metadata.index = index;
+        destination->metadata.bytesused = copied;
+        if (copied != bytes)
+            destination->metadata.flags |= V4L2_BUF_FLAG_ERROR;
+        destination->ready = true;
+        destination->queued = false;
+        return true;
+    }
+    return false;
+}
+
+static void
+safety_capture_once(void)
+{
+    struct client *secondary = NULL;
+    struct v4l2_requestbuffers request;
+    struct v4l2_buffer buffer;
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    void *pixels = MAP_FAILED;
+    size_t map_length = 0;
+    int streaming = 0;
+
+    pthread_mutex_lock(&app.state_lock);
+    if (!safety_secondary_ready_locked(&secondary) ||
+        monotonic_ns() < app.safety_next_ns) {
+        pthread_mutex_unlock(&app.state_lock);
+        return;
+    }
+    app.safety_client = secondary;
+    pthread_mutex_unlock(&app.state_lock);
+
+    memset(&request, 0, sizeof(request));
+    request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    request.memory = V4L2_MEMORY_MMAP;
+    request.count = 1;
+    pthread_mutex_lock(&app.camera_lock);
+    if (xioctl(app.camera_fd, VIDIOC_REQBUFS, &request) == -1 || request.count == 0)
+        goto done;
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.type = request.type;
+    buffer.memory = request.memory;
+    if (xioctl(app.camera_fd, VIDIOC_QUERYBUF, &buffer) == -1)
+        goto done;
+    map_length = buffer.length;
+    pixels = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+        app.camera_fd, buffer.m.offset);
+    if (pixels == MAP_FAILED)
+        goto done;
+    if (xioctl(app.camera_fd, VIDIOC_QBUF, &buffer) == -1 ||
+        xioctl(app.camera_fd, VIDIOC_STREAMON, &type) == -1)
+        goto done;
+    streaming = 1;
+    {
+        struct pollfd source_poll = { .fd = app.camera_fd, .events = POLLIN };
+        if (poll(&source_poll, 1, 2000) <= 0)
+            goto done;
+    }
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.type = request.type;
+    buffer.memory = request.memory;
+    if (xioctl(app.camera_fd, VIDIOC_DQBUF, &buffer) == -1)
+        goto done;
+    pthread_mutex_lock(&app.state_lock);
+    if (app.control_client == NULL && app.ports[1].client == secondary &&
+        deliver_frame_locked(secondary, pixels, buffer.bytesused, &buffer))
+        app.safety_next_ns = monotonic_ns() + app.safety_interval_ns;
+    pthread_mutex_unlock(&app.state_lock);
+    cuse_poll_wakeup();
+done:
+    if (streaming)
+        (void)xioctl(app.camera_fd, VIDIOC_STREAMOFF, &type);
+    if (pixels != MAP_FAILED)
+        (void)munmap(pixels, map_length);
+    memset(&request, 0, sizeof(request));
+    request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    request.memory = V4L2_MEMORY_MMAP;
+    (void)xioctl(app.camera_fd, VIDIOC_REQBUFS, &request);
+    pthread_mutex_unlock(&app.camera_lock);
+    pthread_mutex_lock(&app.state_lock);
+    if (app.safety_client == secondary)
+        app.safety_client = NULL;
+    pthread_cond_broadcast(&app.state_changed);
+    pthread_mutex_unlock(&app.state_lock);
+}
+
+static void *
+safety_worker(void *unused)
+{
+    (void)unused;
+    while (!stop_requested) {
+        safety_capture_once();
+        {
+            struct timespec interval = { .tv_sec = 0, .tv_nsec = 100000000L };
+            (void)nanosleep(&interval, NULL);
+        }
+    }
+    return NULL;
+}
+#endif
+
 static void *
 capture_worker(void *unused)
 {
@@ -446,6 +592,10 @@ capture_worker(void *unused)
                 struct client *recipient = app.ports[port_index].client;
                 if (recipient == NULL || !recipient->streaming)
                     continue;
+#ifdef V4LLIVEVIEW_SAFETY
+                if (port_index == 1 && monotonic_ns() < app.safety_next_ns)
+                    continue;
+#endif
                 target = MAX_BUFFERS;
                 for (unsigned int index = 0; index < recipient->count; ++index) {
                     if (recipient->buffers[index].queued &&
@@ -470,6 +620,10 @@ capture_worker(void *unused)
                     destination->metadata.flags |= V4L2_BUF_FLAG_ERROR;
                 destination->ready = true;
                 destination->queued = false;
+#ifdef V4LLIVEVIEW_SAFETY
+                if (port_index == 1)
+                    app.safety_next_ns = monotonic_ns() + app.safety_interval_ns;
+#endif
             }
         }
         pthread_mutex_unlock(&app.state_lock);
@@ -711,11 +865,39 @@ v4l_open_impl(struct cuse_dev *device, int flags)
         free(client);
         return EBUSY;
     }
+    /* A fresh physical file handle prevents stale webcamd MMAP mappings
+     * across released/reallocated buffer generations. Keep this handle for
+     * the entire virtual capture session, never reopen it per frame. */
+    if (app.control_client == NULL) {
+        bool first_client = true;
+        for (unsigned int index = 0; index < V4LLIVEVIEW_PORTS; ++index)
+            if (app.ports[index].client != NULL)
+                first_client = false;
+        if (first_client) {
+            if (app.camera_fd >= 0)
+                (void)close(app.camera_fd);
+            app.camera_fd = open(app.camera_path, O_RDWR | O_NONBLOCK);
+            if (app.camera_fd < 0) {
+                int error = errno;
+                pthread_mutex_unlock(&app.state_lock);
+                free(client);
+                return error;
+            }
+        }
+    }
     client->port = port;
+#ifdef V4LLIVEVIEW_SAFETY
+    /* Safety has fixed roles: slot 0 is the only camera-control endpoint. */
+    if (port->slot == 0) {
+        client->control_owner = true;
+        app.control_client = client;
+    }
+#else
     if (app.control_client == NULL) {
         client->control_owner = true;
         app.control_client = client;
     }
+#endif
     port->client = client;
     cuse_dev_set_per_file_handle(device, client);
     pthread_mutex_unlock(&app.state_lock);
@@ -736,6 +918,10 @@ v4l_close_impl(struct cuse_dev *device, int flags)
     pthread_mutex_lock(&app.state_lock);
     while (app.capture_client == client)
         (void)pthread_cond_wait(&app.state_changed, &app.state_lock);
+#ifdef V4LLIVEVIEW_SAFETY
+    while (app.safety_client == client)
+        (void)pthread_cond_wait(&app.state_changed, &app.state_lock);
+#endif
     pthread_mutex_unlock(&app.state_lock);
     pthread_mutex_lock(&app.camera_lock);
     free_buffers_locked(client);
@@ -1283,7 +1469,11 @@ run_background(void)
 static void
 usage(const char *program)
 {
+#ifdef V4LLIVEVIEW_SAFETY
+    fprintf(stderr, "usage: %s /dev/videoN [first_virtual_port] [interval_seconds]\n", program);
+#else
     fprintf(stderr, "usage: %s /dev/videoN [first_virtual_port]\n", program);
+#endif
 }
 
 int
@@ -1291,16 +1481,25 @@ main(int argc, char **argv)
 {
     pthread_t capture_thread;
     pthread_t cuse_thread;
+#ifdef V4LLIVEVIEW_SAFETY
+    pthread_t safety_thread;
+#endif
     struct sigaction action;
     int result;
     unsigned int port_index;
     unsigned long first_port = 0;
 
-    if (argc != 2 && argc != 3) {
+    if (argc < 2 || argc >
+#ifdef V4LLIVEVIEW_SAFETY
+        4
+#else
+        3
+#endif
+        ) {
         usage(argv[0]);
         return 64;
     }
-    if (argc == 3) {
+    if (argc >= 3) {
         char *end;
         errno = 0;
         first_port = strtoul(argv[2], &end, 10);
@@ -1309,6 +1508,21 @@ main(int argc, char **argv)
             return 64;
         }
     }
+#ifdef V4LLIVEVIEW_SAFETY
+    app.safety_interval_ns = UINT64_C(10000000000);
+    if (argc == 4) {
+        char *end;
+        unsigned long seconds;
+        errno = 0;
+        seconds = strtoul(argv[3], &end, 10);
+        if (errno || end == argv[3] || *end || seconds == 0 ||
+            seconds > UINT64_MAX / UINT64_C(1000000000)) {
+            usage(argv[0]);
+            return 64;
+        }
+        app.safety_interval_ns = (uint64_t)seconds * UINT64_C(1000000000);
+    }
+#endif
     memset(&action, 0, sizeof(action));
     action.sa_handler = request_stop;
     (void)sigaction(SIGINT, &action, NULL);
@@ -1331,6 +1545,7 @@ main(int argc, char **argv)
     for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index) {
         char name[32];
         app.ports[port_index].index = port_index;
+        app.ports[port_index].slot = port_index;
         (void)snprintf(name, sizeof(name), "video_live%u", (unsigned int)first_port + port_index);
         app.ports[port_index].device = cuse_dev_create(&v4l_methods,
             &app.ports[port_index], NULL, geteuid(), getegid(), 0660, "%s",
@@ -1348,7 +1563,11 @@ main(int argc, char **argv)
         }
     }
     if (pthread_create(&capture_thread, NULL, capture_worker, NULL) != 0 ||
-        pthread_create(&cuse_thread, NULL, cuse_worker, NULL) != 0) {
+        pthread_create(&cuse_thread, NULL, cuse_worker, NULL) != 0
+#ifdef V4LLIVEVIEW_SAFETY
+        || pthread_create(&safety_thread, NULL, safety_worker, NULL) != 0
+#endif
+        ) {
         fprintf(stderr, "%s: cannot start worker threads\n", V4LLIVE_NAME);
         stop_requested = 1;
         app.stop = true;
@@ -1374,6 +1593,9 @@ main(int argc, char **argv)
     (void)pthread_kill(cuse_thread, SIGUSR1);
     (void)pthread_join(capture_thread, NULL);
     (void)pthread_join(cuse_thread, NULL);
+#ifdef V4LLIVEVIEW_SAFETY
+    (void)pthread_join(safety_thread, NULL);
+#endif
     (void)cuse_uninit();
     free(app.display_yuyv);
     (void)close(app.camera_fd);

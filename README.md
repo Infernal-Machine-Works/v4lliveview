@@ -16,6 +16,8 @@ source with separate compile flags:
 
 - `v4lliveview`: foreground X11 preview; one virtual port per process.
 - `v4lliveview-background`: no GUI; four virtual ports per process by default.
+- `v4lliveview-safety`: no GUI; exactly two virtual ports, for a primary
+  control client plus a persistent safety-monitor client.
 
 The foreground build uses already-installed CUSE, X11 and libjpeg libraries.
 The background build uses CUSE and pthreads and forwards MJPEG without decoding.
@@ -47,6 +49,30 @@ The first client is the control owner. Additional background ports are monitor
 clients and cannot change format, frame interval or forwarded camera controls.
 Unknown controls remain rejected.
 
+## Safety service
+
+Build and launch the headless safety service with an optional first virtual
+port number and a whole-second sampling interval (default: 10 seconds):
+
+```sh
+make v4lliveview-safety
+sudo ./v4lliveview-safety /dev/video2 0 10
+```
+
+This creates `/dev/video_live0` as the **primary** port and
+`/dev/video_live1` as the **secondary** port. The primary is the sole control
+owner whenever it is open: it alone may set format, frame interval, exposure,
+or white balance, and it receives every frame while streaming. The secondary
+may attach before, during, or after the primary, but is a monitor only.
+
+While the primary streams, the secondary receives one newest frame at most per
+configured interval, provided it has a queued virtual buffer. When the primary
+is absent, the daemon performs one camera-owned MMAP capture sequence only when
+the secondary is attached and has a queued buffer: queue, `STREAMON`, dequeue,
+copy to secondary, then `STREAMOFF`. It does not retain frames for a detached
+secondary client. A primary attach/configuration waits for any short idle
+sample in progress, then takes camera control.
+
 ## Preview and capture behavior
 
 The GUI owns a decoded copy of the last valid image. `STREAMOFF` or closing a
@@ -75,4 +101,3 @@ found epoch-scale timestamps carrying a MONOTONIC flag. The tee does not rewrite
 those timestamps or pretend they are verified exposure times. A control client
 must validate the clock/source contract and distinguish fresh receipt from a
 proven post-action exposure.
-

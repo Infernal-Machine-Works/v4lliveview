@@ -19,5 +19,8 @@ v4lliveview: src/v4lliveview.c Makefile
 v4lliveview-background: src/v4lliveview.c Makefile
 	${CC} ${CPPFLAGS} ${CFLAGS} -DV4LLIVEVIEW_BACKGROUND -DV4LLIVEVIEW_PORTS=${BACKGROUND_PORTS} ${LDFLAGS} -o ${.TARGET} src/v4lliveview.c -lcuse -lpthread
 
+v4lliveview-safety: src/v4lliveview.c Makefile
+	${CC} ${CPPFLAGS} ${CFLAGS} -DV4LLIVEVIEW_BACKGROUND -DV4LLIVEVIEW_SAFETY -DV4LLIVEVIEW_PORTS=2 ${LDFLAGS} -o ${.TARGET} src/v4lliveview.c -lcuse -lpthread
+
 clean:
-	rm -f v4lliveview v4lliveview-background
+	rm -f v4lliveview v4lliveview-background v4lliveview-safety
