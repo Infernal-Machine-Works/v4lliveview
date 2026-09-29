@@ -1,0 +1,30 @@
+#!/bin/sh
+# PROVIDE: v4lliveview_safety
+# REQUIRE: FILESYSTEMS webcamd
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=v4lliveview_safety
+rcvar=${name}_enable
+load_rc_config $name
+
+: ${v4lliveview_safety_enable:=NO}
+: ${v4lliveview_safety_camera:=/dev/video0}
+: ${v4lliveview_safety_first_port:=0}
+: ${v4lliveview_safety_interval:=5}
+
+pidfile=/var/run/${name}.pid
+command=/usr/sbin/daemon
+command_args="-p ${pidfile} /usr/local/sbin/v4lliveview-safety ${v4lliveview_safety_camera} ${v4lliveview_safety_first_port} ${v4lliveview_safety_interval}"
+start_precmd="${name}_prestart"
+
+v4lliveview_safety_prestart()
+{
+    if [ ! -c "${v4lliveview_safety_camera}" ]; then
+        echo "${name}: ${v4lliveview_safety_camera} is not attached"
+        return 1
+    fi
+}
+
+run_rc_command "$1"

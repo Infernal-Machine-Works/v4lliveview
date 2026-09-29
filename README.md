@@ -52,11 +52,11 @@ Unknown controls remain rejected.
 ## Safety service
 
 Build and launch the headless safety service with an optional first virtual
-port number and a whole-second sampling interval (default: 10 seconds):
+port number and a whole-second sampling interval (default: 5 seconds):
 
 ```sh
 make v4lliveview-safety
-sudo ./v4lliveview-safety /dev/video2 0 10
+sudo ./v4lliveview-safety /dev/video0 0 5
 ```
 
 This creates `/dev/video_live0` as the **primary** port and
@@ -72,6 +72,34 @@ the secondary is attached and has a queued buffer: queue, `STREAMON`, dequeue,
 copy to secondary, then `STREAMOFF`. It does not retain frames for a detached
 secondary client. A primary attach/configuration waits for any short idle
 sample in progress, then takes camera control.
+
+## FreeBSD safety-service setup
+
+The repository supplies a root-run rc.d service and a devd rule in `service/`.
+Install the built `v4lliveview-safety` binary as
+`/usr/local/sbin/v4lliveview-safety`, the rc script as
+`/usr/local/etc/rc.d/v4lliveview_safety`, and the devd rule as
+`/usr/local/etc/devd/v4lliveview-safety.conf`. Preserve their root ownership;
+the program creates virtual nodes as `root:webcamd`, mode `0660`.
+
+Set the physical V4L2 node and safety interval in `/etc/rc.conf`:
+
+```sh
+v4lliveview_safety_enable="YES"
+v4lliveview_safety_camera="/dev/video0"
+v4lliveview_safety_first_port="0"
+v4lliveview_safety_interval="5"
+```
+
+`v4lliveview_safety_interval` is a positive whole number of seconds. The rc
+service starts when devd observes creation of the configured physical node and
+stops when that node disappears. Reload devd after installing or changing its
+rule, then start it with `service v4lliveview_safety start`.
+
+Users running primary or secondary applications need `webcamd` group membership
+and a new login session after that membership is changed. The primary opens
+`/dev/video_live0`; the persistent monitor opens `/dev/video_live1`, allocates
+MMAP buffers, queues them, and waits for `poll(2)`/`DQBUF`. Neither needs root.
 
 ## Preview and capture behavior
 

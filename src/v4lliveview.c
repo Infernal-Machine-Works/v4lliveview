@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -61,6 +62,7 @@ struct port {
 
 struct application {
     int camera_fd;
+    gid_t node_gid;
     const char *camera_path;
     pthread_mutex_t camera_lock;
     pthread_mutex_t state_lock;
@@ -93,6 +95,7 @@ struct application {
 
 static struct application app = {
     .camera_fd = -1,
+    .node_gid = (gid_t)-1,
     .camera_lock = PTHREAD_MUTEX_INITIALIZER,
     .state_lock = PTHREAD_MUTEX_INITIALIZER,
     .state_changed = PTHREAD_COND_INITIALIZER,
@@ -688,6 +691,28 @@ forward_ioctl(void *user_data, unsigned long command, size_t size,
 }
 
 static int
+validate_monitor_input(void *user_data)
+{
+    int requested;
+    int current;
+    int result;
+
+    result = copy_in(&requested, user_data, sizeof(requested));
+    if (result != 0)
+        return result;
+    pthread_mutex_lock(&app.camera_lock);
+    result = xioctl(app.camera_fd, VIDIOC_G_INPUT, &current);
+    if (result == -1)
+        result = errno;
+    else
+        result = 0;
+    pthread_mutex_unlock(&app.camera_lock);
+    if (result != 0)
+        return result;
+    return requested == current ? 0 : EBUSY;
+}
+
+static int
 enumerate_yuyv(void *user_data)
 {
     struct v4l2_fmtdesc requested;
@@ -973,8 +998,10 @@ v4l_ioctl_impl(struct cuse_dev *device, int flags, unsigned long command,
     case VIDIOC_ENUMINPUT:
         return forward_ioctl(user_data, command, sizeof(struct v4l2_input), false);
     case VIDIOC_S_INPUT:
-        if (!client->control_owner || client->streaming)
+        if (client->streaming)
             return EBUSY;
+        if (!client->control_owner)
+            return validate_monitor_input(user_data);
         return forward_ioctl(user_data, command, sizeof(int), false);
     case VIDIOC_ENUM_FMT:
         return enumerate_yuyv(user_data);
@@ -1509,7 +1536,7 @@ main(int argc, char **argv)
         }
     }
 #ifdef V4LLIVEVIEW_SAFETY
-    app.safety_interval_ns = UINT64_C(10000000000);
+    app.safety_interval_ns = UINT64_C(5000000000);
     if (argc == 4) {
         char *end;
         unsigned long seconds;
@@ -1530,6 +1557,19 @@ main(int argc, char **argv)
     (void)sigaction(SIGUSR1, &action, NULL);
 
     app.camera_path = argv[1];
+#ifdef V4LLIVEVIEW_SAFETY
+    {
+        struct group *webcamd_group = getgrnam("webcamd");
+        if (webcamd_group == NULL) {
+            fprintf(stderr, "%s: required group webcamd is unavailable\n",
+                V4LLIVE_NAME);
+            return 1;
+        }
+        app.node_gid = webcamd_group->gr_gid;
+    }
+#endif
+    if (app.node_gid == (gid_t)-1)
+        app.node_gid = getegid();
     app.camera_fd = open(argv[1], O_RDWR | O_NONBLOCK);
     if (app.camera_fd == -1) {
         perror(argv[1]);
@@ -1548,7 +1588,7 @@ main(int argc, char **argv)
         app.ports[port_index].slot = port_index;
         (void)snprintf(name, sizeof(name), "video_live%u", (unsigned int)first_port + port_index);
         app.ports[port_index].device = cuse_dev_create(&v4l_methods,
-            &app.ports[port_index], NULL, geteuid(), getegid(), 0660, "%s",
+            &app.ports[port_index], NULL, geteuid(), app.node_gid, 0660, "%s",
             name);
         if (app.ports[port_index].device == NULL) {
             fprintf(stderr, "%s: could not create /dev/%s\n", V4LLIVE_NAME,
