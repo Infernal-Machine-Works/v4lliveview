@@ -103,7 +103,6 @@ static struct application app = {
 
 static volatile sig_atomic_t stop_requested;
 
-#ifdef V4LLIVEVIEW_SAFETY
 static uint64_t
 monotonic_ns(void)
 {
@@ -111,7 +110,22 @@ monotonic_ns(void)
     (void)clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;
 }
-#endif
+
+static uint64_t drop_report_next_ns;
+
+/* Caller must hold app.state_lock. Rate-limited so a persistently slow or
+ * absent client cannot flood stderr at frame rate. */
+static void
+report_drops_locked(void)
+{
+    uint64_t now = monotonic_ns();
+
+    if (now < drop_report_next_ns)
+        return;
+    fprintf(stderr, "%s: frame drops: display=%lu client=%lu\n",
+        V4LLIVE_NAME, app.display_drops, app.client_drops);
+    drop_report_next_ns = now + UINT64_C(1000000000);
+}
 
 static int
 xioctl(int fd, unsigned long request, void *argument)
@@ -379,6 +393,7 @@ copy_for_display(const uint8_t *pixels, size_t bytes, const struct v4l2_buffer *
         new_pixels = realloc(app.display_yuyv, bytes);
         if (new_pixels == NULL) {
             ++app.display_drops;
+            report_drops_locked();
             pthread_mutex_unlock(&app.state_lock);
             return;
         }
@@ -609,6 +624,7 @@ capture_worker(void *unused)
                 }
                 if (target == MAX_BUFFERS) {
                     ++app.client_drops;
+                    report_drops_locked();
                     continue;
                 }
                 struct buffer *destination = &recipient->buffers[target];
@@ -884,9 +900,15 @@ v4l_open_impl(struct cuse_dev *device, int flags)
     client = calloc(1, sizeof(*client));
     if (client == NULL)
         return ENOMEM;
+    /* Lock order is always camera_lock before state_lock (see start_source/
+     * stop_source). Taking camera_lock here too means the fresh-handle
+     * reopen below can never race with a capture/safety worker that holds
+     * only camera_lock while using app.camera_fd for ioctl/mmap. */
+    pthread_mutex_lock(&app.camera_lock);
     pthread_mutex_lock(&app.state_lock);
     if (port->client != NULL) {
         pthread_mutex_unlock(&app.state_lock);
+        pthread_mutex_unlock(&app.camera_lock);
         free(client);
         return EBUSY;
     }
@@ -899,15 +921,17 @@ v4l_open_impl(struct cuse_dev *device, int flags)
             if (app.ports[index].client != NULL)
                 first_client = false;
         if (first_client) {
-            if (app.camera_fd >= 0)
-                (void)close(app.camera_fd);
-            app.camera_fd = open(app.camera_path, O_RDWR | O_NONBLOCK);
-            if (app.camera_fd < 0) {
+            int new_fd = open(app.camera_path, O_RDWR | O_NONBLOCK);
+            if (new_fd < 0) {
                 int error = errno;
                 pthread_mutex_unlock(&app.state_lock);
+                pthread_mutex_unlock(&app.camera_lock);
                 free(client);
                 return error;
             }
+            if (app.camera_fd >= 0)
+                (void)close(app.camera_fd);
+            app.camera_fd = new_fd;
         }
     }
     client->port = port;
@@ -926,6 +950,7 @@ v4l_open_impl(struct cuse_dev *device, int flags)
     port->client = client;
     cuse_dev_set_per_file_handle(device, client);
     pthread_mutex_unlock(&app.state_lock);
+    pthread_mutex_unlock(&app.camera_lock);
     return 0;
 }
 
@@ -938,8 +963,15 @@ v4l_close_impl(struct cuse_dev *device, int flags)
     client = current_client(device);
     if (client == NULL)
         return 0;
-    if (client->streaming)
-        stop_source(client);
+    if (client->streaming) {
+        /* Only the control owner's streaming state is backed by the
+         * physical camera; an abrupt monitor-client disconnect must never
+         * stop the primary's active capture (mirrors VIDIOC_STREAMOFF). */
+        if (client->control_owner)
+            stop_source(client);
+        else
+            client->streaming = false;
+    }
     pthread_mutex_lock(&app.state_lock);
     while (app.capture_client == client)
         (void)pthread_cond_wait(&app.state_changed, &app.state_lock);
@@ -1602,20 +1634,55 @@ main(int argc, char **argv)
             return 1;
         }
     }
-    if (pthread_create(&capture_thread, NULL, capture_worker, NULL) != 0 ||
-        pthread_create(&cuse_thread, NULL, cuse_worker, NULL) != 0
+    {
+        bool capture_started = false;
+        bool cuse_started = false;
 #ifdef V4LLIVEVIEW_SAFETY
-        || pthread_create(&safety_thread, NULL, safety_worker, NULL) != 0
+        bool safety_started = false;
 #endif
-        ) {
-        fprintf(stderr, "%s: cannot start worker threads\n", V4LLIVE_NAME);
-        stop_requested = 1;
-        app.stop = true;
-        for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index)
-            cuse_dev_destroy(app.ports[port_index].device);
-        (void)cuse_uninit();
-        (void)close(app.camera_fd);
-        return 1;
+        bool start_failed = false;
+
+        if (pthread_create(&capture_thread, NULL, capture_worker, NULL) == 0)
+            capture_started = true;
+        else
+            start_failed = true;
+        if (!start_failed) {
+            if (pthread_create(&cuse_thread, NULL, cuse_worker, NULL) == 0)
+                cuse_started = true;
+            else
+                start_failed = true;
+        }
+#ifdef V4LLIVEVIEW_SAFETY
+        if (!start_failed) {
+            if (pthread_create(&safety_thread, NULL, safety_worker, NULL) == 0)
+                safety_started = true;
+            else
+                start_failed = true;
+        }
+#endif
+        if (start_failed) {
+            fprintf(stderr, "%s: cannot start worker threads\n", V4LLIVE_NAME);
+            stop_requested = 1;
+            pthread_mutex_lock(&app.state_lock);
+            app.stop = true;
+            pthread_cond_broadcast(&app.state_changed);
+            pthread_mutex_unlock(&app.state_lock);
+            for (port_index = 0; port_index < V4LLIVEVIEW_PORTS; ++port_index)
+                cuse_dev_destroy(app.ports[port_index].device);
+            if (cuse_started)
+                (void)pthread_kill(cuse_thread, SIGUSR1);
+            if (capture_started)
+                (void)pthread_join(capture_thread, NULL);
+            if (cuse_started)
+                (void)pthread_join(cuse_thread, NULL);
+#ifdef V4LLIVEVIEW_SAFETY
+            if (safety_started)
+                (void)pthread_join(safety_thread, NULL);
+#endif
+            (void)cuse_uninit();
+            (void)close(app.camera_fd);
+            return 1;
+        }
     }
 #ifdef V4LLIVEVIEW_BACKGROUND
     result = run_background();
